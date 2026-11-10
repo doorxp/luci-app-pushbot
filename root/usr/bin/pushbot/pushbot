@@ -16,7 +16,7 @@ function read_config(){
 	"pushbot_ipv4" "ipv4_interface" "pushbot_ipv6" "ipv6_interface" "pushbot_up" "pushbot_down" "cpuload_enable" "cpuload" "temperature_enable" "temperature" \
 	"regular_time" "regular_time_2" "regular_time_3" "interval_time" "crontab" \
 	"client_usage" "client_usage_max" "client_usage_disturb" "client_usage_whitelist" \
-	"web_logged" "ssh_logged" "web_login_failed" "ssh_login_failed" "wifi_connected" "wifi_auth_failed" "login_max_num" "web_login_black" "ip_white_list" "ip_black_timeout" "ip_black_persist" \
+	"web_logged" "ssh_logged" "web_login_failed" "ssh_login_failed" "wifi_connected" "wifi_auth_failed" "inbound_alert" "login_max_num" "web_login_black" "ip_white_list" "ip_black_timeout" "ip_black_persist" \
 	"pushbot_sheep" "starttime" "endtime" "pushbot_whitelist" "pushbot_blacklist" "pushbot_interface" "MAC_online_list" "MAC_offline_list" \
 	"dnd_low_range" \
 	"up_timeout" "down_timeout" "timeout_retry_count" "thread_num" "soc_code" "pve_host" "pve_port"\
@@ -654,6 +654,81 @@ function resolve_inbound_target_name(){
 	[ -n "$alias" ] && printf '%s\n' "$alias" && return 0
 	[ -f "$leases" ] && hostname=$(awk -v ip="$target_ip" '$3==ip && $4!="*" {print $4; exit}' "$leases" 2>/dev/null)
 	[ -n "$hostname" ] && printf '%s\n' "$hostname" || printf '%s\n' '未知设备'
+}
+
+function stop_inbound_listener(){
+	local pid_file="${dir}inbound_listener.pid" pid
+	[ -f "$pid_file" ] || return 0
+	for pid in $(cat "$pid_file" 2>/dev/null); do
+		kill "$pid" >/dev/null 2>&1
+	done
+	rm -f "$pid_file" "${dir}inbound_listener.fifo" >/dev/null 2>&1
+}
+
+function start_inbound_listener(){
+	local pid_file="${dir}inbound_listener.pid" fifo="${dir}inbound_listener.fifo"
+	local conntrack_cmd="${INBOUND_CONNTRACK_CMD:-conntrack}" self="${PUSHBOT_SELF:-/usr/bin/pushbot/pushbot}"
+	local pid alive=1 conntrack_pid worker_pid
+	[ "$inbound_alert" = "1" ] || { stop_inbound_listener; return 0; }
+	command -v "$conntrack_cmd" >/dev/null 2>&1 || {
+		echo "`date "+%Y-%m-%d %H:%M:%S"` 【！！！】入站警告提醒缺少 conntrack 命令" >> ${logfile}
+		return 1
+	}
+	if [ -f "$pid_file" ]; then
+		for pid in $(cat "$pid_file" 2>/dev/null); do
+			kill -0 "$pid" >/dev/null 2>&1 || alive=0
+		done
+		[ "$alive" = "1" ] && return 0
+		stop_inbound_listener
+	fi
+	rm -f "$fifo" >/dev/null 2>&1
+	mkfifo "$fifo" || return 1
+	"$conntrack_cmd" -E -e NEW -o extended > "$fifo" 2>/dev/null &
+	conntrack_pid=$!
+	(
+		while IFS= read -r event; do
+			case "$event" in
+				*'[NEW]'*) "$self" inbound_event "$event" </dev/null >/dev/null 2>&1 ;;
+			esac
+		done < "$fifo"
+	) &
+	worker_pid=$!
+	printf '%s %s\n' "$conntrack_pid" "$worker_pid" > "$pid_file"
+}
+
+function inbound_alert_send(){
+	local event="$1" parsed family protocol source_ip source_port target_ip target_port target_name event_key
+	local alert_title alert_content info
+	[ "$pushbot_enable" = "1" ] && [ "$inbound_alert" = "1" ] || return 0
+	parsed=$(parse_inbound_conntrack_event "$event") || return 0
+	set -- $parsed
+	family="$1"; protocol="$2"; source_ip="$3"; source_port="$4"; target_ip="$5"; target_port="$6"
+	inbound_route_is_wan_to_lan "$source_ip" "$target_ip" || return 0
+	event_key="${source_ip}:${source_port}-${target_ip}:${target_port}"
+	check_dnd_limit inbound "$event_key" "$dnd_low_range" || {
+		echo "`date "+%Y-%m-%d %H:%M:%S"` ${disturb_text}外网入站连接 ${event_key}（低频跳过）" >> ${logfile}
+		return 0
+	}
+	pushbot_disturb || {
+		echo "`date "+%Y-%m-%d %H:%M:%S"` ${disturb_text}外网入站连接 ${event_key}（免打扰跳过）" >> ${logfile}
+		return 0
+	}
+	target_name=$(resolve_inbound_target_name "$target_ip")
+	alert_title="外网入站连接警告"
+	[ -n "$device_name" ] && alert_title="【${device_name}】${alert_title}"
+	if [ -n "$table_enable" ]; then
+		info=$(table_body "协议" "$(printf '%s' "$protocol" | tr 'a-z' 'A-Z')" "外网来源 IP" "$source_ip" "外网来源端口" "$source_port" "内网目标设备" "$target_name" "内网目标 IP" "$target_ip" "内网目标端口" "$target_port")
+		alert_content="${str_splitline}${str_title_start}${font_fail} 入站警告提醒${font_end}${str_title_end}${info}"
+	else
+		alert_content="${str_splitline}${str_title_start}${font_fail} 入站警告提醒${font_end}${str_title_end}${str_linefeed}${str_tab}协议：${str_space}$(printf '%s' "$protocol" | tr 'a-z' 'A-Z')${str_linefeed}${str_tab}外网来源 IP：${str_space}${source_ip}${str_linefeed}${str_tab}外网来源端口：${str_space}${source_port}${str_linefeed}${str_tab}内网目标设备：${str_space}${target_name}${str_linefeed}${str_tab}内网目标 IP：${str_space}${target_ip}${str_linefeed}${str_tab}内网目标端口：${str_space}${target_port}"
+	fi
+	( echo "$lite_enable" | grep -q "content" ) && alert_content="$alert_title"
+	alert_title=$(printf '%s' "$alert_title" | tr '"' "'")
+	alert_content=$(printf '%s' "$alert_content" | tr '"' "'")
+	diy_send "$alert_title" "$alert_content" "$jsonpath" >/dev/null 2>&1
+	local send_rc=$?
+	[ "$send_rc" -eq 0 ] && echo "`date "+%Y-%m-%d %H:%M:%S"` 外网入站连接 ${event_key} 已推送" >> ${logfile} || echo "`date "+%Y-%m-%d %H:%M:%S"` 【！！！】外网入站连接 ${event_key} 推送失败" >> ${logfile}
+	return "$send_rc"
 }
 
 function getip(){
@@ -2820,6 +2895,16 @@ SCRIPT_ARG="$1"
 # 初始化
 read_config
 
+# conntrack 监听器把单条事件交给短生命周期子进程发送，避免受主循环检测间隔影响。
+if [ "$1" = "inbound_event" ]; then
+	inbound_alert_send "$2"
+	exit $?
+fi
+if [ "$1" = "stop_inbound_listener" ]; then
+	stop_inbound_listener
+	exit 0
+fi
+
 # ── 流量数据源探测（缓存到 /tmp，OpenWrt 重启后重新探测） ──
 function init_traffic_source() {
 	# 读取缓存
@@ -2990,6 +3075,7 @@ fi
 
 # 载入在线设备
 pushbot_init;[ $? -eq 1 ] && echo "`date "+%Y-%m-%d %H:%M:%S"` 【！！！】读取设置出错，请检查设置项 " >> ${logfile} && exit
+start_inbound_listener
 echo "`date "+%Y-%m-%d %H:%M:%S"` 【初始化】载入在线设备" >> ${logfile}
 > ${dir}send_enable.lock && pushbot_first && deltemp
 echo "`date "+%Y-%m-%d %H:%M:%S"` 【初始化】初始化完成" >> ${logfile}

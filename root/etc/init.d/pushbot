@@ -5,6 +5,7 @@ STOP=10
 
 start() {
 	# 确保单实例: 先清理所有旧进程(防止并发重启累积多个主进程, 导致 send 等竞争卡死)
+	/usr/bin/pushbot/pushbot stop_inbound_listener >/dev/null 2>&1
 	kill -9 `pgrep -f "/usr/bin/pushbot/pushbot"` 2>/dev/null
 	sleep 1
 	/usr/bin/pushbot/pushbot </dev/null >/dev/null 2>&1 &
@@ -12,6 +13,7 @@ start() {
 }
 
 stop() {
+	/usr/bin/pushbot/pushbot stop_inbound_listener >/dev/null 2>&1
 	kill -9 `pgrep -f "/usr/bin/pushbot/pushbot"` 2>/dev/null
 	echo "pushbot exit ..."
 }

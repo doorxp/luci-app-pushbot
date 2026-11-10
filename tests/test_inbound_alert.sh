@@ -51,6 +51,18 @@ load_function resolve_inbound_target_name || {
 	printf 'not ok - resolve_inbound_target_name is missing\n'
 	exit 1
 }
+load_function start_inbound_listener || {
+	printf 'not ok - start_inbound_listener is missing\n'
+	exit 1
+}
+load_function stop_inbound_listener || {
+	printf 'not ok - stop_inbound_listener is missing\n'
+	exit 1
+}
+load_function inbound_alert_send || {
+	printf 'not ok - inbound_alert_send is missing\n'
+	exit 1
+}
 
 ipv4='[NEW] tcp 6 120 SYN_SENT src=198.51.100.7 dst=203.0.113.9 sport=54321 dport=443 [UNREPLIED] src=192.168.1.20 dst=198.51.100.7 sport=8443 dport=54321'
 assert_eq 'IPv4 DNAT uses the translated LAN target' \
@@ -88,6 +100,62 @@ assert_eq 'PushBot alias wins over DHCP hostname' 'camera' "$(resolve_inbound_ta
 device_aliases=''
 assert_eq 'DHCP hostname is the fallback' 'dhcp-camera' "$(resolve_inbound_target_name '192.168.1.20')"
 assert_eq 'unknown device has an explicit name' '未知设备' "$(resolve_inbound_target_name '192.168.1.99')"
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+dir="$tmpdir/"
+inbound_alert=0
+INBOUND_CONNTRACK_CMD="$tmpdir/conntrack"
+PUSHBOT_SELF="$tmpdir/pushbot"
+cat > "$INBOUND_CONNTRACK_CMD" <<'EOF'
+#!/bin/sh
+printf '%s\n' '[NEW] tcp 6 120 SYN_SENT src=198.51.100.7 dst=203.0.113.9 sport=54321 dport=443 [UNREPLIED] src=192.168.1.20 dst=198.51.100.7 sport=8443 dport=54321'
+printf '%s\n' '[UPDATE] tcp 6 119 ESTABLISHED src=198.51.100.7 dst=203.0.113.9 sport=54321 dport=443 src=192.168.1.20 dst=198.51.100.7 sport=8443 dport=54321'
+EOF
+cat > "$PUSHBOT_SELF" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >> '$tmpdir/events'
+EOF
+chmod +x "$INBOUND_CONNTRACK_CMD" "$PUSHBOT_SELF"
+start_inbound_listener
+assert_eq 'disabled setting does not start the listener' 'absent' "$([ -f "${dir}inbound_listener.pid" ] && echo present || echo absent)"
+
+inbound_alert=1
+start_inbound_listener
+sleep 1
+assert_eq 'listener forwards each NEW event once' '1' "$(wc -l < "$tmpdir/events" | tr -d ' ')"
+assert_eq 'listener invokes the inbound event command' 'inbound_event' "$(awk '{print $1}' "$tmpdir/events")"
+stop_inbound_listener
+assert_eq 'listener PID is cleaned on stop' 'absent' "$([ -f "${dir}inbound_listener.pid" ] && echo present || echo absent)"
+
+parse_inbound_conntrack_event() { printf '%s\n' 'ipv4 tcp 198.51.100.7 54321 192.168.1.20 8443'; }
+inbound_route_is_wan_to_lan() { return 0; }
+resolve_inbound_target_name() { printf '%s\n' 'NAS'; }
+check_dnd_limit() { [ "$1" = 'inbound' ] && [ "$2" = '198.51.100.7:54321-192.168.1.20:8443' ]; }
+pushbot_disturb() { return 0; }
+diy_send() { printf '%s\n%s\n' "$1" "$2" > "$tmpdir/message"; }
+inbound_alert=1
+pushbot_enable=1
+device_name='主路由'
+jsonpath='/tmp/channel.json'
+lite_enable=''
+str_splitline=''
+str_title_start=''
+str_title_end=''
+str_linefeed='|'
+str_tab=''
+str_space=' '
+font_fail=''
+font_end=''
+table_enable=''
+logfile="$tmpdir/log"
+dnd_low_range=1800
+inbound_alert_send 'fixture event'
+message=$(cat "$tmpdir/message")
+case "$message" in *'【主路由】外网入站连接警告'*) ok=1;; *) ok=0;; esac
+assert_eq 'message title includes the router name' '1' "$ok"
+case "$message" in *'TCP'*'198.51.100.7'*'54321'*'NAS'*'192.168.1.20'*'8443'*) ok=1;; *) ok=0;; esac
+assert_eq 'message includes protocol, source, target name and translated endpoint' '1' "$ok"
 
 printf '%s tests, %s failures\n' "$((PASS + FAIL))" "$FAIL"
 [ "$FAIL" -eq 0 ]
