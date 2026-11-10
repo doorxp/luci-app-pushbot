@@ -589,8 +589,12 @@ function parse_inbound_conntrack_event(){
 			}
 		}
 		END {
-			if (proto == "" || nsrc < 2 || ndst < 2 || nsport < 2 || ndport < 2) exit 1
-			if (src[1] == "" || sport[1] == "" || src[2] == "" || sport[2] == "") exit 1
+			if (proto == "" || nsrc != 2 || ndst != 2 || nsport != 2 || ndport != 2) exit 1
+			for (i=1; i<=2; i++) {
+				if (src[i] == "" || dst[i] == "" || sport[i] !~ /^[0-9][0-9]*$/ || dport[i] !~ /^[0-9][0-9]*$/) exit 1
+				if ((sport[i]+0) < 1 || (sport[i]+0) > 65535 || (dport[i]+0) < 1 || (dport[i]+0) > 65535) exit 1
+			}
+			if (dst[2] != src[1] || dport[2] != sport[1]) exit 1
 			family=(index(src[1], ":") ? "ipv6" : "ipv4")
 			print family, proto, src[1], sport[1], src[2], sport[2]
 		}'
@@ -599,7 +603,7 @@ function parse_inbound_conntrack_event(){
 # 返回 IP 路由所落设备在防火墙中的角色: wan / lan / unknown。
 # WAN 不依赖 zone 名：masq=1 或包含默认路由设备的 zone 均视为 WAN。
 function inbound_zone_role_for_ip(){
-	local addr="$1" route_dev default_devs zone_idx zone_net zone_masq net net_dev
+	local addr="$1" route_dev default_devs zone_idx zone_net zone_device zone_masq net net_dev
 	[ -z "$addr" ] && echo unknown && return 1
 	route_dev=$(ip route get "$addr" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
 	[ -z "$route_dev" ] && route_dev=$(ip -6 route get "$addr" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
@@ -609,7 +613,14 @@ function inbound_zone_role_for_ip(){
 	zone_idx=0
 	while uci -q get firewall.@zone[$zone_idx] >/dev/null 2>&1; do
 		zone_net=$(uci -q get firewall.@zone[$zone_idx].network 2>/dev/null)
+		zone_device=$(uci -q get firewall.@zone[$zone_idx].device 2>/dev/null)
 		zone_masq=$(uci -q get firewall.@zone[$zone_idx].masq 2>/dev/null)
+		for net_dev in $zone_device; do
+			if [ "$net_dev" = "$route_dev" ]; then
+				if [ "$zone_masq" = "1" ] || printf '%s\n' "$default_devs" | grep -q -x "$route_dev"; then echo wan; else echo lan; fi
+				return 0
+			fi
+		done
 		for net in $zone_net; do
 			net_dev=$(ubus call network.interface."$net" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
 			[ -z "$net_dev" ] && net_dev=$(uci -q get network."$net".device 2>/dev/null)
@@ -644,56 +655,99 @@ function inbound_route_is_wan_to_lan(){
 }
 
 function resolve_inbound_target_name(){
-	local target_ip="$1" leases mac alias hostname
+	local target_ip="$1" leases mac alias hostname static_ref
 	leases="${INBOUND_DHCP_LEASES:-/tmp/dhcp.leases}"
 	[ -f "$leases" ] || leases="/var/dhcp.leases"
 	[ -f "$leases" ] && mac=$(awk -v ip="$target_ip" '$3==ip {print $2; exit}' "$leases" 2>/dev/null)
+	[ -z "$mac" ] && mac=$(ip neigh show to "$target_ip" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="lladdr"){print $(i+1); exit}}')
+	if [ -z "$mac" ]; then
+		static_ref=$(uci show dhcp 2>/dev/null | grep -F ".ip='$target_ip'" | sed "s/^dhcp\.//;s/\.ip=.*//" | head -n1)
+		[ -n "$static_ref" ] && mac=$(uci -q get "dhcp.${static_ref}.mac" 2>/dev/null)
+	fi
 	if [ -n "$mac" ] && [ -n "$device_aliases" ]; then
 		alias=$(printf '%s\n' "$device_aliases" | awk -v mac="$mac" 'tolower($1)==tolower(mac) {$1=""; sub(/^ /,""); print; exit}')
 	fi
 	[ -n "$alias" ] && printf '%s\n' "$alias" && return 0
-	[ -f "$leases" ] && hostname=$(awk -v ip="$target_ip" '$3==ip && $4!="*" {print $4; exit}' "$leases" 2>/dev/null)
+	if [ -f "$leases" ]; then
+		hostname=$(awk -v ip="$target_ip" '$3==ip && $4!="*" {print $4; exit}' "$leases" 2>/dev/null)
+		[ -z "$hostname" ] && [ -n "$mac" ] && hostname=$(awk -v mac="$mac" 'tolower($2)==tolower(mac) && $4!="*" {print $4; exit}' "$leases" 2>/dev/null)
+	fi
+	[ -z "$hostname" ] && [ -n "$static_ref" ] && hostname=$(uci -q get "dhcp.${static_ref}.name" 2>/dev/null)
 	[ -n "$hostname" ] && printf '%s\n' "$hostname" || printf '%s\n' '未知设备'
 }
 
+function inbound_disturb_allows_send(){
+	local hour="${INBOUND_TEST_HOUR:-$(date +%H)}" quiet=0
+	[ "$pushbot_sheep" = "1" ] || [ "$pushbot_sheep" = "2" ] || return 0
+	[ -n "$starttime" ] && [ -n "$endtime" ] || return 0
+	if [ "$starttime" -lt "$endtime" ]; then
+		[ "$hour" -ge "$starttime" ] && [ "$hour" -lt "$endtime" ] && quiet=1
+	else
+		{ [ "$hour" -ge "$starttime" ] || [ "$hour" -lt "$endtime" ]; } && quiet=1
+	fi
+	[ "$quiet" = "0" ]
+}
+
+function prepare_inbound_send_context(){
+	tempjsonpath="${dir}temp.inbound.$$.json"
+}
+
 function stop_inbound_listener(){
-	local pid_file="${dir}inbound_listener.pid" pid
-	[ -f "$pid_file" ] || return 0
+	local pid_file="${dir}inbound_listener.pid" lock="${dir}inbound_listener.lock" pid tries=0 cmdline
+	while ! mkdir "$lock" 2>/dev/null; do
+		tries=$((tries + 1)); [ "$tries" -ge 50 ] && return 1; sleep 0.1
+	done
+	[ -f "$pid_file" ] || { rmdir "$lock" 2>/dev/null; return 0; }
 	for pid in $(cat "$pid_file" 2>/dev/null); do
+		if [ -r "/proc/$pid/cmdline" ]; then
+			cmdline=$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+			printf '%s' "$cmdline" | grep -qE 'conntrack|pushbot' || continue
+		fi
 		kill "$pid" >/dev/null 2>&1
 	done
 	rm -f "$pid_file" "${dir}inbound_listener.fifo" >/dev/null 2>&1
+	rmdir "$lock" 2>/dev/null
 }
 
 function start_inbound_listener(){
-	local pid_file="${dir}inbound_listener.pid" fifo="${dir}inbound_listener.fifo"
+	local pid_file="${dir}inbound_listener.pid" fifo="${dir}inbound_listener.fifo" lock="${dir}inbound_listener.lock"
 	local conntrack_cmd="${INBOUND_CONNTRACK_CMD:-conntrack}" self="${PUSHBOT_SELF:-/usr/bin/pushbot/pushbot}"
-	local pid alive=1 conntrack_pid worker_pid
-	[ "$inbound_alert" = "1" ] || { stop_inbound_listener; return 0; }
+	local pid alive=1 conntrack_pid worker_pid tries=0
+	while ! mkdir "$lock" 2>/dev/null; do
+		tries=$((tries + 1)); [ "$tries" -ge 50 ] && return 1; sleep 0.1
+	done
+	if [ "$inbound_alert" != "1" ]; then
+		rmdir "$lock" 2>/dev/null
+		stop_inbound_listener
+		return 0
+	fi
 	command -v "$conntrack_cmd" >/dev/null 2>&1 || {
 		echo "`date "+%Y-%m-%d %H:%M:%S"` 【！！！】入站警告提醒缺少 conntrack 命令" >> ${logfile}
+		rmdir "$lock" 2>/dev/null
 		return 1
 	}
 	if [ -f "$pid_file" ]; then
 		for pid in $(cat "$pid_file" 2>/dev/null); do
 			kill -0 "$pid" >/dev/null 2>&1 || alive=0
 		done
-		[ "$alive" = "1" ] && return 0
-		stop_inbound_listener
+		[ "$alive" = "1" ] && { rmdir "$lock" 2>/dev/null; return 0; }
+		for pid in $(cat "$pid_file" 2>/dev/null); do kill "$pid" >/dev/null 2>&1; done
+		rm -f "$pid_file" "$fifo" >/dev/null 2>&1
 	fi
 	rm -f "$fifo" >/dev/null 2>&1
-	mkfifo "$fifo" || return 1
+	mkfifo "$fifo" || { rmdir "$lock" 2>/dev/null; return 1; }
 	"$conntrack_cmd" -E -e NEW -o extended > "$fifo" 2>/dev/null &
 	conntrack_pid=$!
 	(
 		while IFS= read -r event; do
 			case "$event" in
-				*'[NEW]'*) "$self" inbound_event "$event" </dev/null >/dev/null 2>&1 ;;
+				*'[NEW]'*) "$self" inbound_event "$event" </dev/null >/dev/null 2>&1 & ;;
 			esac
 		done < "$fifo"
 	) &
 	worker_pid=$!
 	printf '%s %s\n' "$conntrack_pid" "$worker_pid" > "$pid_file"
+	rmdir "$lock" 2>/dev/null
 }
 
 function inbound_alert_send(){
@@ -709,7 +763,7 @@ function inbound_alert_send(){
 		echo "`date "+%Y-%m-%d %H:%M:%S"` ${disturb_text}外网入站连接 ${event_key}（低频跳过）" >> ${logfile}
 		return 0
 	}
-	pushbot_disturb || {
+	inbound_disturb_allows_send || {
 		echo "`date "+%Y-%m-%d %H:%M:%S"` ${disturb_text}外网入站连接 ${event_key}（免打扰跳过）" >> ${logfile}
 		return 0
 	}
@@ -2897,6 +2951,8 @@ read_config
 
 # conntrack 监听器把单条事件交给短生命周期子进程发送，避免受主循环检测间隔影响。
 if [ "$1" = "inbound_event" ]; then
+	prepare_inbound_send_context
+	trap 'rm -f "$tempjsonpath" >/dev/null 2>&1' EXIT
 	inbound_alert_send "$2"
 	exit $?
 fi

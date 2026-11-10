@@ -81,4 +81,3 @@
 - [ ] 运行定向测试、`sh -n root/usr/bin/pushbot/pushbot root/etc/init.d/pushbot` 和仓库可用的构建/静态检查。
 - [ ] 运行 `git diff --check` 并审查完整 diff，确认默认值、重置配置和旧配置兼容。
 - [ ] 提交 `feat: expose inbound alert setting in LuCI`。
-
