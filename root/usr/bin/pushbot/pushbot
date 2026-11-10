@@ -574,6 +574,88 @@ function iface_is_lan(){
 	return 0
 }
 
+# 解析 conntrack NEW 事件。第二组 src/sport 是应答方向的源端点，
+# 在 DNAT 场景中即 NAT 后的真实内网目标。
+function parse_inbound_conntrack_event(){
+	printf '%s\n' "$1" | awk '
+		BEGIN { proto=""; nsrc=0; ndst=0; nsport=0; ndport=0 }
+		{
+			for (i=1; i<=NF; i++) {
+				if (proto == "" && ($i == "tcp" || $i == "udp")) proto=$i
+				else if ($i ~ /^src=/) { nsrc++; src[nsrc]=substr($i,5) }
+				else if ($i ~ /^dst=/) { ndst++; dst[ndst]=substr($i,5) }
+				else if ($i ~ /^sport=/) { nsport++; sport[nsport]=substr($i,7) }
+				else if ($i ~ /^dport=/) { ndport++; dport[ndport]=substr($i,7) }
+			}
+		}
+		END {
+			if (proto == "" || nsrc < 2 || ndst < 2 || nsport < 2 || ndport < 2) exit 1
+			if (src[1] == "" || sport[1] == "" || src[2] == "" || sport[2] == "") exit 1
+			family=(index(src[1], ":") ? "ipv6" : "ipv4")
+			print family, proto, src[1], sport[1], src[2], sport[2]
+		}'
+}
+
+# 返回 IP 路由所落设备在防火墙中的角色: wan / lan / unknown。
+# WAN 不依赖 zone 名：masq=1 或包含默认路由设备的 zone 均视为 WAN。
+function inbound_zone_role_for_ip(){
+	local addr="$1" route_dev default_devs zone_idx zone_net zone_masq net net_dev
+	[ -z "$addr" ] && echo unknown && return 1
+	route_dev=$(ip route get "$addr" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+	[ -z "$route_dev" ] && route_dev=$(ip -6 route get "$addr" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+	[ -z "$route_dev" ] && echo unknown && return 1
+	default_devs="$(ip route show default 2>/dev/null; ip -6 route show default 2>/dev/null)"
+	default_devs=$(printf '%s\n' "$default_devs" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | sort -u)
+	zone_idx=0
+	while uci -q get firewall.@zone[$zone_idx] >/dev/null 2>&1; do
+		zone_net=$(uci -q get firewall.@zone[$zone_idx].network 2>/dev/null)
+		zone_masq=$(uci -q get firewall.@zone[$zone_idx].masq 2>/dev/null)
+		for net in $zone_net; do
+			net_dev=$(ubus call network.interface."$net" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+			[ -z "$net_dev" ] && net_dev=$(uci -q get network."$net".device 2>/dev/null)
+			[ -z "$net_dev" ] && net_dev=$(uci -q get network."$net".ifname 2>/dev/null)
+			if [ "$net_dev" = "$route_dev" ] || [ "$net" = "$route_dev" ]; then
+				if [ "$zone_masq" = "1" ] || printf '%s\n' "$default_devs" | grep -q -x "$route_dev"; then
+					echo wan
+				else
+					echo lan
+				fi
+				return 0
+			fi
+		done
+		zone_idx=$((zone_idx + 1))
+	done
+	echo unknown
+	return 1
+}
+
+function inbound_is_local_address(){
+	local addr="$1"
+	{ [ "$addr" = "127.0.0.1" ] || [ "$addr" = "::1" ]; } && return 0
+	ip -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -q -F -x "$addr"
+}
+
+function inbound_route_is_wan_to_lan(){
+	local source_role target_role
+	inbound_is_local_address "$2" && return 1
+	source_role=$(inbound_zone_role_for_ip "$1")
+	target_role=$(inbound_zone_role_for_ip "$2")
+	[ "$source_role" = "wan" ] && [ "$target_role" = "lan" ]
+}
+
+function resolve_inbound_target_name(){
+	local target_ip="$1" leases mac alias hostname
+	leases="${INBOUND_DHCP_LEASES:-/tmp/dhcp.leases}"
+	[ -f "$leases" ] || leases="/var/dhcp.leases"
+	[ -f "$leases" ] && mac=$(awk -v ip="$target_ip" '$3==ip {print $2; exit}' "$leases" 2>/dev/null)
+	if [ -n "$mac" ] && [ -n "$device_aliases" ]; then
+		alias=$(printf '%s\n' "$device_aliases" | awk -v mac="$mac" 'tolower($1)==tolower(mac) {$1=""; sub(/^ /,""); print; exit}')
+	fi
+	[ -n "$alias" ] && printf '%s\n' "$alias" && return 0
+	[ -f "$leases" ] && hostname=$(awk -v ip="$target_ip" '$3==ip && $4!="*" {print $4; exit}' "$leases" 2>/dev/null)
+	[ -n "$hostname" ] && printf '%s\n' "$hostname" || printf '%s\n' '未知设备'
+}
+
 function getip(){
 	[ ! "$1" ] && return
 	if [ $1 == "wanipv4" ] ;then
