@@ -67,6 +67,9 @@ msgstr ""
 msgid "Abnormal traffic"
 msgstr ""
 
+msgid "Inbound alert notification"
+msgstr ""
+
 msgid "Add"
 msgstr ""
 

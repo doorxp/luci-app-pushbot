@@ -2,3 +2,4 @@
 config pushbot 'pushbot'
 	option pushbot_enable '0'
 	option sleeptime '60'
+	option inbound_alert '0'

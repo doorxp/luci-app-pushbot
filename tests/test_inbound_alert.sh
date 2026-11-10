@@ -157,5 +157,24 @@ assert_eq 'message title includes the router name' '1' "$ok"
 case "$message" in *'TCP'*'198.51.100.7'*'54321'*'NAS'*'192.168.1.20'*'8443'*) ok=1;; *) ok=0;; esac
 assert_eq 'message includes protocol, source, target name and translated endpoint' '1' "$ok"
 
+controller='ucode/controller/pushbot.uc'
+template='ucode/template/pushbot/pushbot_status.ut'
+pot='po/templates/pushbot.pot'
+po='po/zh_Hans/pushbot.po'
+config='root/etc/config/pushbot'
+grep -q '"inbound_alert"' "$controller" && got=1 || got=0
+assert_eq 'configuration API returns the inbound alert scalar' '1' "$got"
+content_network=$(awk '/function initContentCard\(\)/ {in_content=1} in_content {print} /c1.appendChild\(b1\); container.appendChild\(c1\);/ {exit}' "$template")
+printf '%s\n' "$content_network" | grep -q "mkH('inbound_alert'" && got=1 || got=0
+assert_eq 'push content network card persists the inbound alert toggle' '1' "$got"
+printf '%s\n' "$content_network" | grep -q "_('Inbound alert notification')" && got=1 || got=0
+assert_eq 'push content network card renders the inbound alert label' '1' "$got"
+grep -q '^msgid "Inbound alert notification"$' "$pot" && got=1 || got=0
+assert_eq 'translation template exposes the inbound alert label' '1' "$got"
+grep -A1 '^msgid "Inbound alert notification"$' "$po" | grep -q '^msgstr "入站警告提醒"$' && got=1 || got=0
+assert_eq 'Simplified Chinese label is 入站警告提醒' '1' "$got"
+grep -q "option inbound_alert '0'" "$config" && got=1 || got=0
+assert_eq 'factory configuration keeps inbound alerts disabled' '1' "$got"
+
 printf '%s tests, %s failures\n' "$((PASS + FAIL))" "$FAIL"
 [ "$FAIL" -eq 0 ]

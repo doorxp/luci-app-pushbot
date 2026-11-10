@@ -68,6 +68,9 @@ msgstr "在设定的时间间隔内，流量超出设定的阈值，将触发报
 msgid "Abnormal traffic"
 msgstr "流量异常"
 
+msgid "Inbound alert notification"
+msgstr "入站警告提醒"
+
 msgid "Add"
 msgstr "添加"
 

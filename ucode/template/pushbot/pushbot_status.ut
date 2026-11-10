@@ -2083,6 +2083,7 @@ function initContentCard() {
 	var CT_IPV6_IFACE = PB_val('ipv6_interface', '');
 	var CT_PUSH_UP = PB_bool('pushbot_up');
 	var CT_PUSH_DOWN = PB_bool('pushbot_down');
+	var CT_INBOUND_ALERT = PB_bool('inbound_alert');
 	var CT_CPU_LOAD_EN = PB_bool('cpuload_enable');
 	var CT_CPU_LOAD = PB_val('cpuload', '2');
 	var CT_TEMP_EN = PB_bool('temperature_enable');
@@ -2315,6 +2316,12 @@ function initContentCard() {
 	dRow.appendChild(mkBtn('{{ _('Device online notification') }}',upOn,function(on){ updateFlagInput('pushbot_up', on); }));
 	dRow.appendChild(mkBtn('{{ _('Device offline notification') }}',dnOn,function(on){ updateFlagInput('pushbot_down', on); }));
 	b1.appendChild(dRow);
+
+	/* WAN -> LAN conntrack NEW notification */
+	var inboundHi = mkH('inbound_alert', CT_INBOUND_ALERT ? '1' : '0');
+	var inboundRow=document.createElement('div');inboundRow.style.cssText='display:flex;gap:12px;margin-top:8px';
+	inboundRow.appendChild(mkBtn('{{ _('Inbound alert notification') }}',CT_INBOUND_ALERT,function(on){inboundHi.value=on?'1':'0';}));
+	b1.appendChild(inboundRow);
 
 	c1.appendChild(b1); container.appendChild(c1);
 
@@ -4061,7 +4068,7 @@ var PB_LABELS = {
 	temperature_enable:'{{ _('Temperature monitor') }}', temperature:'{{ _('Temperature threshold') }}',
 	client_usage:'{{ _('Abnormal traffic') }}', client_usage_max:'{{ _('Traffic alert threshold') }}', client_usage_disturb:'{{ _('Traffic DND') }}',
 	pushbot_ipv4:'{{ _('IPv4 change') }}', ipv4_interface:'{{ _('IPv4 interface') }}', pushbot_ipv6:'{{ _('IPv6 change') }}', ipv6_interface:'{{ _('IPv6 interface') }}',
-	web_logged:'{{ _('Web login') }}', ssh_logged:'{{ _('SSH login') }}', web_login_failed:'{{ _('Web failed attempt') }}', ssh_login_failed:'{{ _('SSH failed attempt') }}',
+	web_logged:'{{ _('Web login') }}', ssh_logged:'{{ _('SSH login') }}', web_login_failed:'{{ _('Web failed attempt') }}', ssh_login_failed:'{{ _('SSH failed attempt') }}', inbound_alert:'{{ _('Inbound alert notification') }}',
 	login_max_num:'{{ _('Failed attempts') }}', web_login_black:'{{ _('Auto blacklist') }}', ip_black_timeout:'{{ _('Blacklist time') }}',
 	up_timeout:'{{ _('Redial timeout') }}', down_timeout:'{{ _('Offline timeout') }}', timeout_retry_count:'{{ _('Retry count') }}', thread_num:'{{ _('Threads') }}',
 	soc_code:'{{ _('SOC code') }}', pve_host:'{{ _('PVE host') }}', pve_port:'{{ _('PVE port') }}',
